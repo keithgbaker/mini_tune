@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Mini Tune</title>
+<meta name="theme-color" content="#d9822b">
+<link rel="icon" href="icon-192.png">
+<style>
+/* Mini Tune - zone tone demonstration. Drag the pointer round the map and hear each zone's tone. */
+:root{
+  --bg:#eef1f4; --panel:#ffffff; --ink:#14202b; --muted:#5a6876; --line:#cdd5dd;
+  --road:#3c7d5a; --side:#2f6db3; --shoulder:#1b8796; --rear:#8a5bb8; --instr:#a07a1c; --accent:#d9822b;
+  --f:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; color-scheme:light;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0f151b; --panel:#17212a; --ink:#e6edf3; --muted:#93a2b0; --line:#2a3845;
+  --road:#5fb486; --side:#5f9ae0; --shoulder:#4cc3d1; --rear:#b48ae0; --instr:#d6b25a; --accent:#f0a04b; color-scheme:dark}}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%}
+body{background:var(--bg);color:var(--ink);font:16px/1.45 var(--f);
+  padding:max(12px,env(safe-area-inset-top)) 16px max(12px,env(safe-area-inset-bottom));
+  display:flex;flex-direction:column;gap:12px;max-width:760px;margin:0 auto}
+h1{font-size:1.35rem;margin:0}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px}
+#map{width:100%;height:auto;aspect-ratio:2.2/1;display:block;touch-action:none;cursor:crosshair}
+.zone{font-size:1.6rem;font-weight:700;text-align:center;min-height:1.6em}
+.row{display:flex;gap:8px}
+select{font:700 1rem var(--f);border-radius:10px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:12px 10px;flex:1}
+button{font:700 1rem var(--f);border-radius:10px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:13px 12px;flex:1}
+button.primary{background:var(--accent);border-color:var(--accent);color:#1b1206}
+button:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+.small{font-size:.82rem;color:var(--muted);margin:0}
+</style>
+</head>
+<body>
+<h1>Mini Tune</h1>
+<p class="small">Each observation zone around a driver has its own tone: a pitch set by a simple ratio to the road-ahead tone, placed left, centre or right in stereo to match where the zone is. Drag the pointer around the map (headphones help) to hear them.</p>
+
+<div class="panel"><canvas id="map" width="880" height="400" aria-label="Zone map: drag to move the pointer"></canvas></div>
+<div class="zone" id="zone" aria-live="polite">&nbsp;</div>
+
+<div class="row">
+  <button class="primary" id="btnSound">Sound on</button>
+  <button id="btnCentre">Centre</button>
+  <select id="selZones" aria-label="Zone map"><option value="4">4 zones</option><option value="7">7 zones</option></select>
+</div>
+
+<p class="small">Demonstration only, not a training or driving aid. Use it seated, never while driving.</p>
+<p class="small">GazeTrainer audio zone tones: UK patent application GB2614010.3 (patent pending). &copy; 2026 Keith Baker. All rights reserved.</p>
+
+<script>
+"use strict";
+/* Zone map and tones as described in UK patent application GB2614010.3 (Fig. 1, Table 1, Fig. 4).
+   Yaw in degrees (left negative), pitch in degrees (up positive). Unlisted directions are silent. */
+const F0 = 392;                       // road-ahead reference tone (Hz)
+const ARC = 120;
+// [zone, label, yaw min, yaw max, pitch min, pitch max, colour, frequency ratio, stereo L:R amplitude]
+const ALL = {
+  REAR:  ["REAR",   "Rear mirror",    -15,  15,  15,  45, "--rear",     9/8, [1, 1]],
+  ROAD:  ["ROAD",   "Road ahead",     -15,  15, -15,  15, "--road",     1,   [1, 1]],
+  INSTR: ["INSTR",  "Instruments",   -120, 120, -40, -15, "--instr",    2,   [1, 1]],
+  LMIR:  ["LMIR",   "Left mirror",    -75, -45, -15,  25, "--side",     5/4, [0.87, 0.50]],
+  RMIR:  ["RMIR",   "Right mirror",    45,  75, -15,  25, "--side",     4/3, [0.50, 0.87]],
+  LSHD:  ["LSHD",   "Left shoulder", -120, -90, -15,  25, "--shoulder", 3/2, [1, 0.26]],
+  RSHD:  ["RSHD",   "Right shoulder",  90, 120, -15,  25, "--shoulder", 5/3, [0.26, 1]]};
+const SETS = {"4": ["REAR", "ROAD", "LMIR", "RMIR"],
+              "7": ["REAR", "ROAD", "INSTR", "LMIR", "RMIR", "LSHD", "RSHD"]};
+const TONE_MS = 300, REPEAT_MS = 1000;
+const panOf = ([l, r]) => Math.atan2(r, l) / (Math.PI / 4) - 1;   // equal-power pan from L:R amplitudes
+
+let zones = SETS["4"].map(k => ALL[k]);
+let yaw = 0, pitch = 0, zone = null, ac = null, master = null, timer = null, soundOn = false;
+const cv = document.getElementById("map"), g = cv.getContext("2d");
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+function classify(y, p){
+  for (const z of zones) if (y >= z[2] && y <= z[3] && p >= z[4] && p <= z[5]) return z;
+  return null;
+}
+
+/* ---- audio ---- */
+function audioInit(){
+  if (ac) return;
+  ac = new (window.AudioContext || window.webkitAudioContext)();
+  master = ac.createGain(); master.gain.value = 0.5; master.connect(ac.destination);
+  try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch(e){}
+}
+function playZone(z){
+  const t = ac.currentTime + 0.01, o = ac.createOscillator(), v = ac.createGain();
+  o.type = z[0] === "ROAD" ? "sine" : "triangle";          // road ahead is set apart by timbre
+  o.frequency.value = F0 * z[7];
+  let out = v;
+  if (ac.createStereoPanner){ const p = ac.createStereoPanner(); p.pan.value = panOf(z[8]); v.connect(p); out = p; }
+  v.gain.setValueAtTime(0, t); v.gain.linearRampToValueAtTime(0.9, t + 0.01);
+  v.gain.setValueAtTime(0.9, t + TONE_MS/1000 - 0.04); v.gain.linearRampToValueAtTime(0, t + TONE_MS/1000);
+  o.connect(v); out.connect(master); o.start(t); o.stop(t + TONE_MS/1000 + 0.02);
+}
+function setTone(z){
+  clearInterval(timer); timer = null;
+  if (!z || !soundOn || !ac) return;
+  playZone(z); timer = setInterval(() => playZone(z), REPEAT_MS);
+}
+
+/* ---- drawing ---- */
+const X = y => cv.width/2 + y * (cv.width/2 - 20) / ARC;
+const Y = p => cv.height*0.62 - p * (cv.height*0.55) / 45;
+function draw(){
+  g.clearRect(0, 0, cv.width, cv.height);
+  g.lineWidth = 2; g.textAlign = "center"; g.textBaseline = "middle";
+  for (const z of [...zones].reverse()){
+    const [id, , y0, y1, p0, p1, col] = z;
+    const x0 = X(y0), x1 = X(y1), ya = Y(p1), yb = Y(p0);
+    g.globalAlpha = z === zone ? 0.45 : 0.18; g.fillStyle = css(col); g.fillRect(x0, ya, x1 - x0, yb - ya);
+    g.globalAlpha = 1; g.strokeStyle = css(col); g.strokeRect(x0, ya, x1 - x0, yb - ya);
+    g.fillStyle = css("--ink"); g.font = "bold " + (x1 - x0 < 120 ? 20 : 26) + "px system-ui,sans-serif";
+    g.fillText(id, (x0 + x1)/2, (ya + yb)/2);
+  }
+  g.fillStyle = css("--accent"); g.beginPath(); g.arc(X(yaw), Y(pitch), 16, 0, Math.PI*2); g.fill();
+  g.strokeStyle = css("--ink"); g.lineWidth = 3; g.stroke();
+}
+function update(force){
+  const z = classify(yaw, pitch);
+  if (z !== zone || force){ zone = z; document.getElementById("zone").textContent = z ? z[1] : "\u00a0"; setTone(z); }
+  draw();
+}
+
+/* ---- pointer input (drag only) ---- */
+function fromEvent(e){
+  const r = cv.getBoundingClientRect();
+  const x = (e.clientX - r.left) * cv.width / r.width, y = (e.clientY - r.top) * cv.height / r.height;
+  yaw = Math.max(-ARC, Math.min(ARC, (x - cv.width/2) * ARC / (cv.width/2 - 20)));
+  pitch = Math.max(-40, Math.min(45, (cv.height*0.62 - y) * 45 / (cv.height*0.55)));
+  update();
+}
+let dragging = false;
+cv.addEventListener("pointerdown", e => { dragging = true; try{ cv.setPointerCapture(e.pointerId); }catch(_){} fromEvent(e); });
+cv.addEventListener("pointermove", e => { if (dragging) fromEvent(e); });
+cv.addEventListener("pointerup", () => { dragging = false; });
+cv.addEventListener("pointercancel", () => { dragging = false; });
+
+document.getElementById("btnSound").addEventListener("click", e => {
+  audioInit(); if (ac.state === "suspended") ac.resume();
+  soundOn = !soundOn; e.target.textContent = soundOn ? "Sound off" : "Sound on"; setTone(zone);
+});
+document.getElementById("btnCentre").addEventListener("click", () => { yaw = 0; pitch = 0; update(); });
+document.getElementById("selZones").addEventListener("change", e => {
+  zones = SETS[e.target.value].map(k => ALL[k]); zone = undefined; update(true);
+});
+if (matchMedia) { const m = matchMedia("(prefers-color-scheme: dark)"); if (m.addEventListener) m.addEventListener("change", draw); }
+update(true);
+</script>
+</body>
+</html>
